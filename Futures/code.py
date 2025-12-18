@@ -1,171 +1,210 @@
 import time
-import numpy as np
-import pandas as pd
 import requests
+import threading
+import pandas as pd
+import numpy as np
 from binance.client import Client
-from ta.momentum import RSIIndicator
 
 # ================== НАСТРОЙКИ ==================
+
 API_KEY = "41bJFweA1m3Mp9UOTXMr82kQeFCSGu2AtYweii1Rn9CacNTeHor3tPzZfOa1Ty7q"
 API_SECRET = "JTNiSXaKeBvcl3oFDN8GgP6rR2KgCfIhW8f1ByEAU4EsD2Ijid1dAn8b9wBotHS6"
 
-SYMBOL = "AAVEUSDT"
-LEVERAGE = 20
+client = Client(API_KEY, API_SECRET)
+client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
-MARGIN_USDT = 20        # маржа на сделку
-TAKE_PROFIT_USDT = 6    # скальпинг TP
-STOP_LOSS_USDT = 3
+SYMBOLS = [
+    "AAVEUSDT",
+    "LTCUSDT",
+    "HBARUSDC",
+    "INJUSDC",
+    "ADAUSDC"
+]
 
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 CANDLES = 100
+LEVERAGE = 20
+MAX_MARGIN = 15
+RISK_PER_TRADE = 10
+
+# ===== Telegram =====
+TG_TOKEN = "8554034676:AAEIEPOwkWYFz9_dpDla2jfu-t5EDRpSygE"
+CHAT_ID = "5540625088"
+
+BOT_ON = True
+stats = {"trades": 0, "tp": 0, "sl": 0}
+
 
 # ================== TELEGRAM ==================
-TOKEN = "8554034676:AAEIEPOwkWYFz9_dpDla2jfu-t5EDRpSygE"
-CHAT_ID = "5540625088"   # ОБЯЗАТЕЛЬНО вставь свой chat_id
 
-def tg_notify(text):
+def tg(msg):
     try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=5)
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
     except:
         pass
 
-# ================== BINANCE ==================
-client = Client(
-    API_KEY,
-    API_SECRET,
-    testnet=True,
-    requests_params={'timeout': 30}
-)
+def telegram_listener():
+    global BOT_ON
+    offset = 0
+    while True:
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset={offset}"
+            ).json()
+            for u in r["result"]:
+                offset = u["update_id"] + 1
+                cmd = u["message"]["text"]
 
-client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+                if cmd == "/start":
+                    BOT_ON = True
+                    tg("✅ Бот зап")
+                elif cmd == "/stop":
+                    BOT_ON = False
+                    tg("⛔ Бот остановлен")
+                elif cmd == "/status":
+                    tg(f"📊 Статус: {'ON' if BOT_ON else 'OFF'}")
+                elif cmd == "/stats":
+                    tg(str(stats))
+                elif cmd == "/positions":
+                    show_positions()
+        except:
+            pass
+        time.sleep(2)
 
-# ================== UTILS ==================
-def get_precision(symbol):
+# ================== DATA ==================
+
+def get_klines(symbol):
+    kl = client.futures_klines(symbol=symbol, interval=INTERVAL, limit=CANDLES)
+    df = pd.DataFrame(kl, columns=[
+        "time","o","h","l","c","v","x","q","n","t","T","i"
+    ])
+    df = df.astype(float)
+    return df
+
+# ================== INDICATORS ==================
+
+def indicators(df):
+    df["ema9"] = df["c"].ewm(span=9).mean()
+    df["ema21"] = df["c"].ewm(span=21).mean()
+
+    delta = df["c"].diff()
+    gain = delta.clip(lower=0).rolling(7).mean()
+    loss = -delta.clip(upper=0).rolling(7).mean()
+    rs = gain / loss
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    df["atr"] = (df["h"] - df["l"]).rolling(7).mean()
+    df["vol_ma"] = df["v"].rolling(20).mean()
+    return df
+
+# ================== POSITIONS ==================
+
+def open_positions():
+    pos = client.futures_position_information()
+    active = {}
+    for p in pos:
+        amt = float(p["positionAmt"])
+        if amt != 0:
+            active[p["symbol"]] = p
+    return active
+
+def show_positions():
+    pos = open_positions()
+    if not pos:
+        tg("📭 Открытых позиций нет")
+        return
+    msg = "📌 ОТКРЫТЫЕ ПОЗИЦИИ:\n\n/start /stop /status /stats /positions "
+
+    for s,p in pos.items():
+        msg += (
+            f"{s}\n"
+            f"Количество монет: {p['positionAmt']}\n"
+            f"Точка входа: {p['entryPrice']}\n"
+            f"Прибыль: {p['unRealizedProfit']} USDT\n\n"
+            
+        )
+    tg(msg)
+
+# ================== TRADING ==================
+def round_qty(symbol, qty):
     info = client.futures_exchange_info()
     for s in info["symbols"]:
         if s["symbol"] == symbol:
-            step = float(s["filters"][2]["stepSize"])
-            return int(round(-np.log10(step), 0))
-    return 3
+            for f in s["filters"]:
+                if f["filterType"] == "LOT_SIZE":
+                    step = float(f["stepSize"])
+                    precision = int(round(-np.log10(step), 0))
+                    return round(qty, precision)
+    return qty
+def trade(symbol):
+    global stats
 
-PRECISION = get_precision(SYMBOL)
+    if symbol in open_positions():
+        return
 
-def get_price():
-    return float(client.futures_symbol_ticker(symbol=SYMBOL)["price"])
-
-def get_qty(price):
-    qty = (MARGIN_USDT * LEVERAGE) / price
-    return round(qty, PRECISION)
-
-# ================== DATA ==================
-def get_klines(retries=5):
-    for _ in range(retries):
-        try:
-            klines = client.futures_klines(
-                symbol=SYMBOL,
-                interval=INTERVAL,
-                limit=CANDLES
-            )
-            df = pd.DataFrame(klines, columns=[
-                "time","open","high","low","close","volume",
-                "ct","qav","trades","tb","tq","ignore"
-            ])
-            df["close"] = df["close"].astype(float)
-            df["volume"] = df["volume"].astype(float)
-            return df
-        except Exception as e:
-            print("Ошибка свечей:", e)
-            time.sleep(5)
-    return None
-
-# ================== STRATEGY ==================
-def check_scalping_signal(df):
-    df["EMA8"] = df["close"].ewm(span=8).mean()
-    df["EMA21"] = df["close"].ewm(span=21).mean()
-    df["RSI"] = RSIIndicator(df["close"], 5).rsi()
-    df["VOL_MA"] = df["volume"].rolling(20).mean()
-
+    df = indicators(get_klines(symbol))
     last = df.iloc[-1]
 
-    print(
-        f"EMA8={last['EMA8']:.2f} | EMA21={last['EMA21']:.2f} | "
-        f"RSI={last['RSI']:.2f} | VOL={last['volume']:.0f}"
-        f" | VOL_MA={last['VOL_MA']:.0f}"
-        f" | price={last['close']:.2f}"
+    long_signal = (
+        last.ema9 > last.ema21 and
+        last.rsi > 50 and
+        last.v > last.vol_ma
     )
 
-    if (
-        last["EMA8"] > last["EMA21"] and
-        last["RSI"] < 20 and
-        last["volume"] > last["VOL_MA"]
-    ):
-        return "LONG"
-
-    if (
-        last["EMA8"] < last["EMA21"] and
-        last["RSI"] > 80 and
-        last["volume"] > last["VOL_MA"]
-    ):
-        return "SHORT"
-
-    return None
-
-# ================== MAIN ==================
-tg_notify("🤖 Скальпинг-бот запущен (EMA + RSI + Volume)")
-
-while True:
-    df = get_klines()
-    if df is None:
-        continue
-
-    signal = check_scalping_signal(df)
-
-    if signal is None:
-        time.sleep(10)
-        continue
-
-    side = "BUY" if signal == "LONG" else "SELL"
-    exit_side = "SELL" if signal == "LONG" else "BUY"
-
-    price = get_price()
-    qty = get_qty(price)
-
-    # ===== ВХОД =====
-    client.futures_create_order(
-        symbol=SYMBOL,
-        side=side,
-        type="MARKET",
-        quantity=qty
+    short_signal = (
+        last.ema9 < last.ema21 and
+        last.rsi < 50 and
+        last.v > last.vol_ma
     )
 
-    entry_price = price
-    tg_notify(f"🚀 {signal} ВХОД\nЦена: {entry_price}\nQty: {qty}")
+    if not (long_signal or short_signal):
+        return
 
-    # ===== TP / SL =====
-    while True:
-        price = get_price()
+    price = last.c
+    atr = last.atr
+    side = "BUY" if long_signal else "SELL"
 
-        pnl = (
-            (price - entry_price) * qty
-            if signal == "LONG"
-            else (entry_price - price) * qty
+    raw_qty = (RISK_PER_TRADE * LEVERAGE) / price
+    qty = round_qty(symbol, raw_qty)
+    
+    try:
+        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+
+        client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type="MARKET",
+            quantity=qty
         )
 
-        if pnl >= TAKE_PROFIT_USDT or pnl <= -STOP_LOSS_USDT:
-            client.futures_create_order(
-                symbol=SYMBOL,
-                side=exit_side,
-                type="MARKET",
-                quantity=qty
-            )
+        stats["trades"] += 1
 
-            result = "✅ TP" if pnl > 0 else "🛑 SL"
-            tg_notify(
-                f"{result} {signal}\nPnL: {pnl:.2f} USDT\nЦена: {price}"
-            )
-            break
+        tp = price + atr*2 if side=="BUY" else price - atr*2
+        sl = price - atr if side=="BUY" else price + atr
 
-        time.sleep(1)
+        tg(
+            f"🚀 ВХОД {symbol}\n"
+            f"{side}\n"
+            f"Цена: {price}\n"
+            f"TP: {round(tp,2)}\n"
+            f"SL: {round(sl,2)}"
+        )
 
-    time.sleep(30)
+    except Exception as e:
+        tg(f"❌ Ошибка {symbol}: {e}")
+
+# ================== MAIN ==================
+
+threading.Thread(target=telegram_listener, daemon=True).start()
+tg("🤖 Бот запущен\n\n/start /stop /status /stats /positions")
+
+while True:
+    if BOT_ON:
+        for s in SYMBOLS:
+            try:
+                trade(s)
+                time.sleep(1)
+            except:
+                pass
+    time.sleep(10)
