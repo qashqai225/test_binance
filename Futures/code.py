@@ -15,7 +15,6 @@ SYMBOLS = ["AAVEUSDT", "LTCUSDT", "HBARUSDC", "INJUSDT", "ADAUSDC"]
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 CANDLES = 100
 LEVERAGE = 20
-MAX_MARGIN = 15
 RISK_PER_TRADE = 10
 
 # ===== Telegram =====
@@ -102,7 +101,7 @@ def show_positions():
         )
     tg(msg)
 
-# ================== TRADING ==================
+# ================== HELPERS ==================
 def round_qty(symbol, qty):
     info = client.futures_exchange_info()
     for s in info["symbols"]:
@@ -114,6 +113,18 @@ def round_qty(symbol, qty):
                     return round(qty, precision)
     return qty
 
+def round_price(symbol, price):
+    info = client.futures_exchange_info()
+    for s in info["symbols"]:
+        if s["symbol"] == symbol:
+            for f in s["filters"]:
+                if f["filterType"] == "PRICE_FILTER":
+                    tick = float(f["tickSize"])
+                    precision = int(round(-np.log10(tick), 0))
+                    return round(price, precision)
+    return price
+
+# ================== TRADING ==================
 def trade(symbol):
     global stats
     if symbol in open_positions():
@@ -129,6 +140,10 @@ def trade(symbol):
     side = "BUY" if long_signal else "SELL"
     raw_qty = (RISK_PER_TRADE * LEVERAGE) / price
     qty = round_qty(symbol, raw_qty)
+    # TP/SL: 3 к 1
+    tick = 0.0001  # минимальный шаг цены (для ADAUSDC, взять tickSize из фильтров)
+    tp = price + max(atr*3, tick) if side=="BUY" else price - max(atr*3, tick)
+    sl = price - max(atr, tick) if side=="BUY" else price + max(atr, tick)
     try:
         client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
         client.futures_create_order(
@@ -142,8 +157,8 @@ def trade(symbol):
             f"🚀 ВХОД {symbol}\n"
             f"{side}\n"
             f"Цена: {price}\n"
-            f"TP: {round(price + atr*3 if side=='BUY' else price - atr*3, 3)}\n"
-            f"SL: {round(price - atr if side=='BUY' else price + atr, 3)}"
+            f"TP: {round_price(symbol,tp)}\n"
+            f"SL: {round_price(symbol,sl)}"
         )
     except Exception as e:
         tg(f"❌ Ошибка {symbol}: {e}")
@@ -161,8 +176,9 @@ def check_tp_sl():
                     df = get_klines(symbol)
                     price = df["c"].iloc[-1]
                     atr = indicators(df)["atr"].iloc[-1]
-                    tp = entry + atr*2 if side=="BUY" else entry - atr*2
-                    sl = entry - atr if side=="BUY" else entry + atr
+                    tick = 0.0001
+                    tp = entry + max(atr*3, tick) if side=="BUY" else entry - max(atr*3, tick)
+                    sl = entry - max(atr, tick) if side=="BUY" else entry + max(atr, tick)
                     if (side=="BUY" and (price >= tp or price <= sl)) or \
                        (side=="SELL" and (price <= tp or price >= sl)):
                         qty = round_qty(symbol, abs(amt))
@@ -170,7 +186,8 @@ def check_tp_sl():
                             symbol=symbol,
                             side="SELL" if side=="BUY" else "BUY",
                             type="MARKET",
-                            quantity=qty
+                            quantity=qty,
+                            reduceOnly=True
                         )
                         stats["tp" if (price>=tp if side=="BUY" else price<=tp) else "sl"] += 1
                         tg(f"✂️ ЗАКРЫТИЕ {symbol}\n{side} по {'TP' if (price>=tp if side=='BUY' else price<=tp) else 'SL'}\nЦена: {price}")
