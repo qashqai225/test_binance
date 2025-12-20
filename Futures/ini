@@ -1,1 +1,2 @@
 STOP = entry_price − 1.2 × ATR
+:.5f
