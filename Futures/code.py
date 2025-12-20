@@ -17,7 +17,7 @@ INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
 LEVERAGE = 20
 RISK_PER_TRADE = 10
-TP_ROI = 0.10   # +10% ROI
+TP_ROI = 0.10
 
 BOT_ON = True
 
@@ -28,7 +28,6 @@ client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 exchange_info = client.futures_exchange_info()
 
 def get_filters(symbol):
-    """Возвращает шаг количества, минимальное количество и шаг цены для символа"""
     for s in exchange_info["symbols"]:
         if s["symbol"] == symbol:
             lot = next(f for f in s["filters"] if f["filterType"] == "LOT_SIZE")
@@ -36,27 +35,29 @@ def get_filters(symbol):
             return float(lot["stepSize"]), float(lot["minQty"]), float(price["tickSize"])
     return 0.001, 0.001, 0.01
 
+def step_precision(step):
+    return max(0, len(str(step).split('.')[-1].rstrip('0')))
+
 def fmt_qty(symbol, qty):
-    """Форматирует количество под шаг и минимум"""
     step, min_qty, _ = get_filters(symbol)
-    # округляем вниз до ближайшего шага
+    precision = step_precision(step)
     q = floor(qty / step) * step
-    # определяем precision по stepSize
-    precision = max(0, -int(floor(round(step, 8).as_integer_ratio()[1]).bit_length()/3.3219))
-    q = round(q, precision if precision > 0 else 8)
+    q = round(q, precision)
     return q if q >= min_qty else 0
 
 def fmt_price(symbol, price):
-    """Форматирует цену под шаг цены"""
     _, _, tick = get_filters(symbol)
+    precision = step_precision(tick)
     p = floor(price / tick) * tick
-    # определяем precision по tickSize
-    precision = max(0, -int(floor(round(tick, 8).as_integer_ratio()[1]).bit_length()/3.3219))
-    p = round(p, precision if precision > 0 else 8)
-    return p
+    return round(p, precision)
+
 
 # ================== STATE ==================
 positions = {}
+stats = {
+    "trades": 0,
+    "pnl": 0.0
+}
 
 # ================== TELEGRAM ==================
 def tg(msg):
@@ -65,7 +66,8 @@ def tg(msg):
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": msg}
         )
-    except: pass
+    except:
+        pass
 
 def telegram_listener():
     global BOT_ON
@@ -90,10 +92,14 @@ def telegram_listener():
                 elif text == "/positions":
                     show_positions()
 
+                elif text == "/stats":
+                    show_stats()
+
                 elif text.startswith("/close"):
                     sym = text.split()[1].upper()
                     close_position(sym, manual=True)
-        except: pass
+        except:
+            pass
         time.sleep(2)
 
 # ================== DATA ==================
@@ -128,29 +134,19 @@ def trade(symbol):
         return
 
     side = "BUY" if long else "SELL"
-    price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
-    price = fmt_price(symbol, price)
+    price = fmt_price(symbol, float(client.futures_symbol_ticker(symbol=symbol)["price"]))
 
-    raw_qty = (RISK_PER_TRADE * LEVERAGE) / price
-    qty = fmt_qty(symbol, raw_qty)
+    qty = fmt_qty(symbol, (RISK_PER_TRADE * LEVERAGE) / price)
     if qty == 0:
         return
 
     client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
-    client.futures_create_order(
-        symbol=symbol,
-        side=side,
-        type="MARKET",
-        quantity=qty
-    )
+    client.futures_create_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
 
-    # TP рассчитываем и сразу округляем по шагу цены
-    tp_price = (
-        price * (1 + TP_ROI / LEVERAGE)
-        if side == "BUY"
-        else price * (1 - TP_ROI / LEVERAGE)
-    )
-    tp_price = fmt_price(symbol, tp_price)  # округление по tickSize
+    tp_price = price * (1 + TP_ROI / LEVERAGE) if side == "BUY" else price * (1 - TP_ROI / LEVERAGE)
+    tp_price = fmt_price(symbol, tp_price)
+
+    tp_pnl = abs(tp_price - price) * qty
 
     positions[symbol] = {
         "side": side,
@@ -162,9 +158,9 @@ def trade(symbol):
     tg(
         f"🚀 ENTRY {symbol} {side}\n"
         f"Entry: {price}\n"
-        f"Qty: {qty}\n"
-        f"TP (ROI 10%): {tp_price}"
-        f"\n\n/start /stop /positions "
+        f"TP: {tp_price}\n"
+        f"TP PnL: {tp_pnl:.2f} USDT"
+        f"\n/start /stop /positions /stats\n"
     )
 
 # ================== CLOSE ==================
@@ -172,37 +168,40 @@ def close_position(symbol, manual=False):
     if symbol not in positions:
         return
 
-    pos_info = client.futures_position_information(symbol=symbol)
-    amt = abs(float(pos_info[0]["positionAmt"]))
-    qty = fmt_qty(symbol, amt)
+    p = positions[symbol]
+    price = fmt_price(symbol, float(client.futures_symbol_ticker(symbol=symbol)["price"]))
 
-    if qty == 0:
-        positions.pop(symbol, None)
-        return
+    pnl = (price - p["entry"]) * p["qty"]
+    if p["side"] == "SELL":
+        pnl = -pnl
 
-    side = positions[symbol]["side"]
+    stats["trades"] += 1
+    stats["pnl"] += pnl
 
     client.futures_create_order(
         symbol=symbol,
-        side="SELL" if side == "BUY" else "BUY",
+        side="SELL" if p["side"] == "BUY" else "BUY",
         type="MARKET",
-        quantity=qty
+        quantity=p["qty"]
     )
 
-    tg(f"{'✂️ MANUAL CLOSE\n\n/start /stop /positions ' if manual else '✅ TP HIT\n\n/start /stop /positions '} {symbol}")
-    positions.pop(symbol, None)
+    tg(
+        f"{'✂️ MANUAL CLOSE' if manual else '✅ TP HIT'} {symbol}\n"
+        f"PnL: {pnl:.2f} USDT"
+        f"\n/start /stop /positions /stats\n"
+    )
+
+    positions.pop(symbol)
 
 # ================== MANAGER ==================
 def manage_positions():
     while True:
-        for symbol, p in list(positions.items()):
-            price = float(client.futures_symbol_ticker(symbol=symbol)["price"])
-            price = fmt_price(symbol, price)
-
+        for s, p in list(positions.items()):
+            price = fmt_price(s, float(client.futures_symbol_ticker(symbol=s)["price"]))
             if p["side"] == "BUY" and price >= p["tp"]:
-                close_position(symbol)
+                close_position(s)
             elif p["side"] == "SELL" and price <= p["tp"]:
-                close_position(symbol)
+                close_position(s)
         time.sleep(1)
 
 # ================== UI ==================
@@ -213,20 +212,32 @@ def show_positions():
 
     msg = "📌 OPEN POSITIONS\n\n"
     for s,p in positions.items():
+        price = fmt_price(s, float(client.futures_symbol_ticker(symbol=s)["price"]))
+        pnl = (price - p["entry"]) * p["qty"]
+        if p["side"] == "SELL":
+            pnl = -pnl
+
         msg += (
             f"{s} | {p['side']}\n"
             f"Entry: {p['entry']}\n"
             f"TP: {p['tp']}\n"
-            f"Qty: {p['qty']}\n\n"
-            f"\n/start /stop /positions "
+            f"PnL: {pnl:.2f} USDT\n\n"
         )
     tg(msg)
+
+def show_stats():
+    tg(
+        f"📊 STATS\n"
+        f"Trades: {stats['trades']}\n"
+        f"Total PnL: {stats['pnl']:.2f} USDT"
+        f"\n/start /stop /positions /stats\n"
+    )
 
 # ================== MAIN ==================
 threading.Thread(target=telegram_listener, daemon=True).start()
 threading.Thread(target=manage_positions, daemon=True).start()
 
-tg("🤖 BOT STARTED\n/start /stop /positions /close SYMBOL")
+tg("🤖 BOT STARTED\n/start /stop /positions /stats\n")
 
 while True:
     if BOT_ON:
