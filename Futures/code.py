@@ -4,6 +4,8 @@ import threading
 import pandas as pd
 from binance.client import Client
 from math import floor
+import json
+
 
 # ================== CONFIG ==================
 API_KEY = "41bJFweA1m3Mp9UOTXMr82kQeFCSGu2AtYweii1Rn9CacNTeHor3tPzZfOa1Ty7q"
@@ -18,11 +20,13 @@ INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 LEVERAGE = 20
 RISK_PER_TRADE = 10
 TP_ROI = 0.10
+SL_ROI = 0.20   # 🔴 STOP LOSS 20% ROI
 
 BOT_ON = True
 
 client = Client(API_KEY, API_SECRET)
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+
 
 # ================== EXCHANGE INFO ==================
 exchange_info = client.futures_exchange_info()
@@ -59,50 +63,90 @@ stats = {
     "pnl": 0.0
 }
 
+
 # ================== TELEGRAM ==================
-def tg(msg):
+def tg(msg, buttons=True):
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": msg,
+        "parse_mode": "HTML"
+    }
+
+    if buttons:
+        payload["reply_markup"] = {
+            "inline_keyboard": [
+                [
+                    {"text": "▶️ Старт", "callback_data": "start"},
+                    {"text": "⏹ Стоп", "callback_data": "stop"}
+                ],
+                [
+                    {"text": "📜 Відкриті позиції", "callback_data": "positions"},
+                    {"text": "📊 Статистика", "callback_data": "stats"}
+                ],
+                [
+                    {"text": "🗑️ Закрити всі позиції", "callback_data": "close_all"}
+                ]
+            ]
+        }
+
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": msg}
+            json=payload
         )
     except:
         pass
 
-def telegram_listener():
+
+def handle_callback(data):
     global BOT_ON
+
+    if data == "start":
+        BOT_ON = True
+        tg("🤖 BOT Запущен\n\n Гарного профіту")
+
+    elif data == "stop":
+        BOT_ON = False
+        tg("🔴 BOT Зупинений")
+
+    elif data == "positions":
+        show_positions()
+
+    elif data == "stats":
+        show_stats()
+
+    elif data == "close_all":
+        for s in list(positions.keys()):
+            close_position(s, manual=True)
+        tg("❌ Всі позиції закриті")
+
+
+def telegram_listener():
     offset = 0
     while True:
         try:
             r = requests.get(
                 f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset={offset}"
             ).json()
+
             for u in r.get("result", []):
                 offset = u["update_id"] + 1
-                text = u["message"]["text"]
 
-                if text == "/start":
-                    BOT_ON = True
-                    tg("🟢 BOT ON")
+                if "callback_query" in u:
+                    handle_callback(u["callback_query"]["data"])
 
-                elif text == "/stop":
-                    BOT_ON = False
-                    tg("🔴 BOT OFF")
-
-                elif text == "/positions":
-                    show_positions()
-
-                elif text == "/stats":
-                    show_stats()
-
-                elif text.startswith("/close"):
-                    sym = text.split()[1].upper()
-                    close_position(sym, manual=True)
+                elif "message" in u:
+                    text = u["message"]["text"]
+                    if text.startswith("/close"):
+                        sym = text.split()[1].upper()
+                        close_position(sym, manual=True)
         except:
             pass
-        time.sleep(2)
 
-# ================== DATA ==================
+        time.sleep(1)
+
+
+# ================== MARKET DATA ==================
 def get_klines(symbol):
     df = pd.DataFrame(
         client.futures_klines(symbol=symbol, interval=INTERVAL, limit=100),
@@ -110,6 +154,8 @@ def get_klines(symbol):
     )
     return df.astype(float)
 
+
+# ================== INDICATORS ==================
 def indicators(df):
     df["ema9"] = df["c"].ewm(span=9).mean()
     df["ema21"] = df["c"].ewm(span=21).mean()
@@ -119,6 +165,7 @@ def indicators(df):
     df["rsi"] = 100 - (100 / (1 + gain / loss))
     df["vol_ma"] = df["v"].rolling(20).mean()
     return df
+
 
 # ================== TRADE ==================
 def trade(symbol):
@@ -144,27 +191,29 @@ def trade(symbol):
     client.futures_create_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
 
     tp_price = price * (1 + TP_ROI / LEVERAGE) if side == "BUY" else price * (1 - TP_ROI / LEVERAGE)
-    tp_price = fmt_price(symbol, tp_price)
+    sl_price = price * (1 - SL_ROI / LEVERAGE) if side == "BUY" else price * (1 + SL_ROI / LEVERAGE)
 
-    tp_pnl = abs(tp_price - price) * qty
+    tp_price = fmt_price(symbol, tp_price)
+    sl_price = fmt_price(symbol, sl_price)
 
     positions[symbol] = {
         "side": side,
         "entry": price,
         "qty": qty,
-        "tp": tp_price
+        "tp": tp_price,
+        "sl": sl_price
     }
 
     tg(
-        f"🚀 ENTRY {symbol} {side}\n"
-        f"Entry: {price}\n"
-        f"TP: {tp_price}\n"
-        f"TP PnL: {tp_pnl:.2f} USDT"
-        f"\n/start /stop /positions /stats\n"
+        f"🚀 <b>Вхід в позицію</b> {side}\n<i>{symbol}</i>\n"
+        f"<i>Entry:</i> <b>{price}</b>\n"
+        f"<i>TP:</i> <b>{tp_price}</b>\n"
+        f"<i>SL:</i> <b>{sl_price}</b>"
     )
 
+
 # ================== CLOSE ==================
-def close_position(symbol, manual=False):
+def close_position(symbol, manual=False, sl=False):
     if symbol not in positions:
         return
 
@@ -185,32 +234,49 @@ def close_position(symbol, manual=False):
         quantity=p["qty"]
     )
 
+    if manual:
+        title = "🗑️ Закрито вручну"
+    elif sl:
+        title = "🛑 STOP LOSS"
+    else:
+        title = "✅ TAKE PROFIT 💸"
+
     tg(
-        f"{'✂️ MANUAL CLOSE' if manual else '✅ TP HIT'} {symbol}\n"
-        f"PnL: {pnl:.2f} USDT"
-        f"\n/start /stop /positions /stats\n"
+        f"{title} {symbol}\n"
+        f"<i>PnL:</i> <b>{pnl:.2f}</b> USDT"
     )
 
     positions.pop(symbol)
+
 
 # ================== MANAGER ==================
 def manage_positions():
     while True:
         for s, p in list(positions.items()):
             price = fmt_price(s, float(client.futures_symbol_ticker(symbol=s)["price"]))
-            if p["side"] == "BUY" and price >= p["tp"]:
-                close_position(s)
-            elif p["side"] == "SELL" and price <= p["tp"]:
-                close_position(s)
+
+            if p["side"] == "BUY":
+                if price >= p["tp"]:
+                    close_position(s)
+                elif price <= p["sl"]:
+                    close_position(s, sl=True)
+
+            else:
+                if price <= p["tp"]:
+                    close_position(s)
+                elif price >= p["sl"]:
+                    close_position(s, sl=True)
+
         time.sleep(1)
+
 
 # ================== UI ==================
 def show_positions():
     if not positions:
-        tg("📭 No open positions")
+        tg("📭 <b>Немає відкритих позицій</b>")
         return
 
-    msg = "📌 OPEN POSITIONS\n\n"
+    msg = "📜 ВІДКРИТІ ПОЗИЦІЇ\n\n"
     for s,p in positions.items():
         price = fmt_price(s, float(client.futures_symbol_ticker(symbol=s)["price"]))
         pnl = (price - p["entry"]) * p["qty"]
@@ -218,26 +284,28 @@ def show_positions():
             pnl = -pnl
 
         msg += (
-            f"{s} | {p['side']}\n"
-            f"Entry: {p['entry']}\n"
-            f"TP: {p['tp']}\n"
-            f"PnL: {pnl:.2f} USDT\n\n"
+            f"<b>{s}</b> | <i>{p['side']}</i>\n"
+            f"Entry: <b>{p['entry']}</b>\n"
+            f"TP: <b>{p['tp']}</b>\n"
+            f"SL: <b>{p['sl']}</b>\n"
+            f"PnL: <b>{pnl:.2f}</b> USDT\n\n"
         )
     tg(msg)
 
+
 def show_stats():
     tg(
-        f"📊 STATS\n"
+        f"📊 СТАТИСТИКА\n"
         f"Trades: {stats['trades']}\n"
-        f"Total PnL: {stats['pnl']:.2f} USDT"
-        f"\n/start /stop /positions /stats\n"
+        f"Total PnL: <b>{stats['pnl']:.2f}</b> USDT"
     )
+
 
 # ================== MAIN ==================
 threading.Thread(target=telegram_listener, daemon=True).start()
 threading.Thread(target=manage_positions, daemon=True).start()
 
-tg("🤖 BOT STARTED\n/start /stop /positions /stats\n")
+tg("🤖 BOT ЗАПУЩЕН 🚀")
 
 while True:
     if BOT_ON:

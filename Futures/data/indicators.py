@@ -1,15 +1,9 @@
-def add_ema(df, fast=9, slow=21):
-    df["ema_fast"] = df["c"].ewm(span=fast).mean()
-    df["ema_slow"] = df["c"].ewm(span=slow).mean()
-    return df
-
-def add_rsi(df, period=7):
+def indicators(df):
+    df["ema9"] = df["c"].ewm(span=9).mean()
+    df["ema21"] = df["c"].ewm(span=21).mean()
     delta = df["c"].diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = -delta.clip(upper=0).rolling(period).mean()
+    gain = delta.clip(lower=0).rolling(7).mean()
+    loss = -delta.clip(upper=0).rolling(7).mean()
     df["rsi"] = 100 - (100 / (1 + gain / loss))
-    return df
-
-def add_volume_ma(df, period=20):
-    df["vol_ma"] = df["v"].rolling(period).mean()
+    df["vol_ma"] = df["v"].rolling(20).mean()
     return df
