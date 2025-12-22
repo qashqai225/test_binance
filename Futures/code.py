@@ -19,13 +19,14 @@ INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 
 LEVERAGE = 20
 RISK_PER_TRADE = 10
-TP_ROI = 0.10
+TP_ROI = 0.15
 SL_ROI = 0.20   # 🔴 STOP LOSS 20% ROI
 
 BOT_ON = True
 
 client = Client(API_KEY, API_SECRET)
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+client.timestamp_offset = client.get_server_time()["serverTime"] - int(time.time() * 1000)
 
 
 # ================== EXCHANGE INFO ==================
@@ -160,8 +161,8 @@ def indicators(df):
     df["ema9"] = df["c"].ewm(span=9).mean()
     df["ema21"] = df["c"].ewm(span=21).mean()
     delta = df["c"].diff()
-    gain = delta.clip(lower=0).rolling(7).mean()
-    loss = -delta.clip(upper=0).rolling(7).mean()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
     df["rsi"] = 100 - (100 / (1 + gain / loss))
     df["vol_ma"] = df["v"].rolling(20).mean()
     return df
