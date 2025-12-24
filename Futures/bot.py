@@ -3,62 +3,67 @@ import requests
 import threading
 import pandas as pd
 from binance.client import Client
-from math import floor
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 
 # ================== CONFIG ==================
 API_KEY = "41bJFweA1m3Mp9UOTXMr82kQeFCSGu2AtYweii1Rn9CacNTeHor3tPzZfOa1Ty7q"
 API_SECRET = "JTNiSXaKeBvcl3oFDN8GgP6rR2KgCfIhW8f1ByEAU4EsD2Ijid1dAn8b9wBotHS6"
-
 TG_TOKEN = "8554034676:AAEIEPOwkWYFz9_dpDla2jfu-t5EDRpSygE"
 CHAT_ID = "5540625088"
-
 SYMBOLS = ["AAVEUSDT","LTCUSDT","INJUSDT","XRPUSDT","ADAUSDT","HBARUSDT"]
 INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 BOT_ON = True
-
 LEVERAGE = 20
 RISK_PER_TRADE = 10
-TP_ROI = [0.05, 0.10, 0.15]  # TP1 / TP2 / TP3 в процентах
-SL_ROI = 0.20                 # стоп-лосс в процентах
-BE_TRIGGER = 0.005             # 0.5% прибыли для переноса SL в BE
-TRAILING_STEP = 0.003           # шаг трейлинг стопа 0.3%
-
+TP_ROI = [0.1, 0.15, 0.25] # TP1 / TP2 / TP3 %
+TP_PARTS = [0.3, 0.3, 0.4] # % объема для каждого TP
+SL_ROI = 0.30 # стоп-лосс %
+BE_TRIGGER = 0.005 # 0.5% прибыли для переноса SL в BE
+TRAILING_STEP = 0.003 # шаг трейлинг стопа 0.3%
 # ================== BINANCE CLIENT ==================
 client = Client(API_KEY, API_SECRET)
-client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+client.fapi_url = "https://testnet.binancefuture.com/fapi"
 client.timestamp_offset = client.get_server_time()["serverTime"] - int(time.time() * 1000)
-
 # ================== STATE ==================
 positions = {}
 stats = {"trades": 0, "pnl": 0.0, "win": 0, "loss": 0}
-
 # ================== EXCHANGE INFO ==================
 exchange_info = client.futures_exchange_info()
+symbol_filters = {}
 
 def get_filters(symbol):
+    if symbol in symbol_filters:
+        return symbol_filters[symbol]
+    
     for s in exchange_info["symbols"]:
         if s["symbol"] == symbol:
             lot = next(f for f in s["filters"] if f["filterType"] == "LOT_SIZE")
             price = next(f for f in s["filters"] if f["filterType"] == "PRICE_FILTER")
-            return float(lot["stepSize"]), float(lot["minQty"]), float(price["tickSize"])
+            step = float(lot["stepSize"])
+            min_qty = float(lot["minQty"])
+            tick = float(price["tickSize"])
+            symbol_filters[symbol] = (step, min_qty, tick)
+            return step, min_qty, tick
     return 0.001, 0.001, 0.01
+
+def quantize_decimal(value: float, step: float) -> float:
+    if value <= 0:
+        return 0.0
+    d_value = Decimal(str(value))
+    d_step = Decimal(str(step))
+    quantized = (d_value // d_step) * d_step
+    return float(quantized)
 
 def fmt_qty(symbol, qty):
     step, min_qty, _ = get_filters(symbol)
-    step = Decimal(str(step))
-    qty = Decimal(str(qty))
-    q = (qty // step) * step
-    q = q.quantize(step, rounding=ROUND_DOWN)
-    return float(q) if q >= Decimal(str(min_qty)) else 0
+    q = quantize_decimal(qty, step)
+    if q < min_qty:
+        return 0.0
+    return q
 
 def fmt_price(symbol, price):
     _, _, tick = get_filters(symbol)
-    tick = Decimal(str(tick))
-    price = Decimal(str(price))
-    p = (price // tick) * tick
-    p = p.quantize(tick, rounding=ROUND_DOWN)
-    return float(p)
+    return quantize_decimal(price, tick)
 
 # ================== MARKET DATA ==================
 def get_klines(symbol):
@@ -70,13 +75,33 @@ def get_klines(symbol):
 
 # ================== INDICATORS ==================
 def indicators(df):
+    # EMA
     df["ema9"] = df["c"].ewm(span=9).mean()
     df["ema21"] = df["c"].ewm(span=21).mean()
+    
+    # MACD (12,26,9)
+    ema12 = df["c"].ewm(span=12, adjust=False).mean()
+    ema26 = df["c"].ewm(span=26, adjust=False).mean()
+    df["macd"] = ema12 - ema26
+    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+    
+    # Stochastic Oscillator (14, 3, 3) — стандартные параметры
+    period = 14
+    df["lowest_low"] = df["l"].rolling(window=period).min()
+    df["highest_high"] = df["h"].rolling(window=period).max()
+    df["stoch_k"] = 100 * (df["c"] - df["lowest_low"]) / (df["highest_high"] - df["lowest_low"])
+    df["stoch_d"] = df["stoch_k"].rolling(window=3).mean()  # %D — SMA от %K за 3 периода
+    
+    # RSI
     delta = df["c"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = -delta.clip(upper=0).rolling(14).mean()
     df["rsi"] = 100 - (100 / (1 + gain / loss))
+    
+    # Volume MA
     df["vol_ma"] = df["v"].rolling(20).mean()
+    
     return df
 
 # ================== TELEGRAM ==================
@@ -151,23 +176,57 @@ def trade(symbol):
     if symbol in positions: return
     df = indicators(get_klines(symbol))
     last = df.iloc[-1]
-    long = last.ema9 > last.ema21 and last.rsi > 50 and last.v > last.vol_ma
-    short = last.ema9 < last.ema21 and last.rsi < 50 and last.v > last.vol_ma
+    prev = df.iloc[-2]
+    
+    # Базовые условия тренда
+    long_base = last.ema9 > last.ema21 and last.v > last.vol_ma
+    short_base = last.ema9 < last.ema21 and last.v > last.vol_ma
+    
+    # MACD кроссовер
+    macd_bull_cross = (prev.macd < prev.macd_signal) and (last.macd > last.macd_signal)
+    macd_bear_cross = (prev.macd > prev.macd_signal) and (last.macd < last.macd_signal)
+    
+    # Stochastic условия: кроссовер %K и %D в зоне перепроданности/перекупленности
+    stoch_bull_cross = (prev.stoch_k < prev.stoch_d) and (last.stoch_k > last.stoch_d) and (last.stoch_k < 20)
+    stoch_bear_cross = (prev.stoch_k > prev.stoch_d) and (last.stoch_k < last.stoch_d) and (last.stoch_k > 80)
+    
+    # RSI фильтр (избегаем экстремальных зон)
+    rsi_ok = 30 < last.rsi < 70
+    
+    # Итоговые сигналы
+    long = long_base and macd_bull_cross and stoch_bull_cross and rsi_ok
+    short = short_base and macd_bear_cross and stoch_bear_cross and rsi_ok
+    
     if not (long or short): return
+    
     side = "BUY" if long else "SELL"
     price = fmt_price(symbol, float(client.futures_symbol_ticker(symbol=symbol)["price"]))
     qty = fmt_qty(symbol, (RISK_PER_TRADE * LEVERAGE) / price)
     if qty == 0: return
+    
     client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
     client.futures_create_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
+    
     if side == "BUY":
-        tp_prices = [fmt_price(symbol, price * (1 + tp / LEVERAGE)) for tp in TP_ROI]
-        sl_price = fmt_price(symbol, price * (1 - SL_ROI / LEVERAGE))
+        tp_prices = [fmt_price(symbol, price*(1+tp/LEVERAGE)) for tp in TP_ROI]
+        sl_price = fmt_price(symbol, price*(1-SL_ROI/LEVERAGE))
     else:
-        tp_prices = [fmt_price(symbol, price * (1 - tp / LEVERAGE)) for tp in TP_ROI]
-        sl_price = fmt_price(symbol, price * (1 + SL_ROI / LEVERAGE))
-    positions[symbol] = {"side": side, "entry": price, "qty": qty, "tp_prices": tp_prices, "sl": sl_price, "tp_closed": [False]*len(TP_ROI)}
-    tg(f"🚀 <b>Вхід в позицію</b> {side}\n<i>{symbol}</i>\n<i>Entry:</i> <b>{price}</b>\n<i>TP1:</i> <b>{tp_prices[0]}</b>\n<i>TP2:</i> <b>{tp_prices[1]}</b>\n<i>TP3:</i> <b>{tp_prices[2]}</b>\n<i>SL:</i> <b>{sl_price}</b>")
+        tp_prices = [fmt_price(symbol, price*(1-tp/LEVERAGE)) for tp in TP_ROI]
+        sl_price = fmt_price(symbol, price*(1+SL_ROI/LEVERAGE))
+    
+    positions[symbol] = {
+        "side": side,
+        "entry": price,
+        "qty": qty,
+        "initial_qty": qty,
+        "tp_prices": tp_prices,
+        "tp_parts": TP_PARTS,
+        "sl": sl_price,
+        "tp_closed": [False]*len(TP_ROI)
+    }
+    
+    reason = "MACD + Stochastic crossover" if long else "MACD + Stochastic crossover"
+    tg(f"🚀 <b>Вхід в позицію</b> {side}\n<i>{symbol}</i>\n<i>Причина:</i> {reason}\n<i>Entry:</i> <b>{price}</b>\n<i>TP1:</i> <b>{tp_prices[0]}</b>\n<i>TP2:</i> <b>{tp_prices[1]}</b>\n<i>TP3:</i> <b>{tp_prices[2]}</b>\n<i>SL:</i> <b>{sl_price}</b>")
 
 # ================== CLOSE ==================
 def close_position(symbol, qty=None, manual=False, sl=False):
@@ -175,19 +234,22 @@ def close_position(symbol, qty=None, manual=False, sl=False):
     p = positions[symbol]
     price = fmt_price(symbol, float(client.futures_symbol_ticker(symbol=symbol)["price"]))
     close_qty = qty if qty else p["qty"]
-    pnl = (price - p["entry"]) * close_qty
-    if p["side"] == "SELL": pnl = -pnl
+    if close_qty == 0: return
+    pnl = (price - p["entry"])*close_qty
+    if p["side"]=="SELL": pnl=-pnl
     stats["trades"] += 1
     stats["pnl"] += pnl
-    if pnl > 0: stats["win"] += 1
-    else: stats["loss"] += 1
+    if pnl>0: stats["win"]+=1
+    else: stats["loss"]+=1
     client.futures_create_order(symbol=symbol, side="SELL" if p["side"]=="BUY" else "BUY", type="MARKET", quantity=close_qty)
-    if manual: title = "🗑️ Закрито вручну"
-    elif sl: title = "🛑 STOP LOSS"
-    else: title = "✅ TAKE PROFIT 💸"
+    if manual: title="🗑️ Закрито вручну"
+    elif sl: title="🛑 STOP LOSS"
+    else: title="✅ TAKE PROFIT 💸"
     tg(f"{title} {symbol}\n<i>PnL:</i> <b>{pnl:.2f}</b> USDT\n<i>Статистика:</i> Trades={stats['trades']}, PnL={stats['pnl']:.2f}, Win={stats['win']}, Loss={stats['loss']}")
-    if qty is None or qty >= p["qty"]: positions.pop(symbol)
-    else: p["qty"] -= qty
+    if qty is None or qty >= p["qty"]: 
+        positions.pop(symbol)
+    else: 
+        p["qty"] -= qty
 
 # ================== MANAGER ==================
 def manage_positions():
@@ -195,32 +257,47 @@ def manage_positions():
         for s, p in list(positions.items()):
             price = fmt_price(s, float(client.futures_symbol_ticker(symbol=s)["price"]))
             side = p["side"]
+            # ===== TP PARTIAL CLOSE =====
             for i, tp_price in enumerate(p["tp_prices"]):
-                if not p["tp_closed"][i] and ((side=="BUY" and price>=tp_price) or (side=="SELL" and price<=tp_price)):
-                    tp_qty = fmt_qty(s, p["qty"] / (len(p["tp_prices"])-i))
-                    close_position(s, qty=tp_qty)
-                    p["tp_closed"][i] = True
-            if side=="BUY" and price-p["entry"]>=p["entry"]*BE_TRIGGER and p["sl"]<p["entry"]:
-                p["sl"] = p["entry"]
-                tg(f"🛡️ Stop Loss перенесено в BE для {s}")
-            elif side=="SELL" and p["entry"]-price>=p["entry"]*BE_TRIGGER and p["sl"]>p["entry"]:
-                p["sl"] = p["entry"]
-                tg(f"🛡️ Stop Loss перенесено в BE для {s}")
-            if side=="BUY":
-                new_sl = price - price*TRAILING_STEP
-                if new_sl>p["sl"]: p["sl"]=fmt_price(s,new_sl)
+                if p["tp_closed"][i]:
+                    continue
+                hit = (side == "BUY" and price >= tp_price) or \
+                      (side == "SELL" and price <= tp_price)
+                if not hit:
+                    continue
+                if i < len(p["tp_parts"]) - 1:
+                    raw_qty = p["initial_qty"] * p["tp_parts"][i]
+                    tp_qty = fmt_qty(s, raw_qty)
+                else:
+                    tp_qty = fmt_qty(s, p["qty"])
+                if tp_qty <= 0 or tp_qty > p["qty"]:
+                    continue
+                close_position(s, qty=tp_qty)
+                p["tp_closed"][i] = True
+            # ===== BREAKEVEN =====
+            if side == "BUY" and price >= p["entry"] * (1 + BE_TRIGGER):
+                p["sl"] = fmt_price(s, p["entry"])
+            elif side == "SELL" and price <= p["entry"] * (1 - BE_TRIGGER):
+                p["sl"] = fmt_price(s, p["entry"])
+            # ===== TRAILING =====
+            if side == "BUY":
+                new_sl = fmt_price(s, price * (1 - TRAILING_STEP))
+                if new_sl > p["sl"]:
+                    p["sl"] = new_sl
             else:
-                new_sl = price + price*TRAILING_STEP
-                if new_sl<p["sl"]: p["sl"]=fmt_price(s,new_sl)
-            if (side=="BUY" and price<=p["sl"]) or (side=="SELL" and price>=p["sl"]):
+                new_sl = fmt_price(s, price * (1 + TRAILING_STEP))
+                if new_sl < p["sl"]:
+                    p["sl"] = new_sl
+            # ===== STOP LOSS =====
+            if (side == "BUY" and price <= p["sl"]) or \
+               (side == "SELL" and price >= p["sl"]):
                 close_position(s, sl=True)
         time.sleep(1)
 
 # ================== MAIN ==================
 threading.Thread(target=manage_positions, daemon=True).start()
 threading.Thread(target=telegram_listener, daemon=True).start()
-tg("🤖 Бот запущен 🚀")
-
+tg("🤖 Працівник працює 🚀 (EMA + MACD + Stochastic)")
 while True:
     if BOT_ON:
         for s in SYMBOLS:
