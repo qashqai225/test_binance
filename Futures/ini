@@ -1,3 +1,5 @@
 STOP = entry_price − 1.2 × ATR
 :.5f
 весь твой файл с TP1/TP2/TP3 + трейлинг + BE + частичное закрытие по объему, где точно будет соблюдаться шаг для qty и price
+(Implement take profit logic) with multiple targets, trailing stop, break-even, and partial closes, ensuring correct step for qty and price.
+(Implement dynamic position sizing) based on account balance and risk management rules.

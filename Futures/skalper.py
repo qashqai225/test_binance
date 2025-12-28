@@ -8,6 +8,10 @@ import os
 from binance.client import Client
 from math import floor
 from functools import wraps
+import logging
+
+# ================== LOGGING ==================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ================== CONFIG ==================
 API_KEY = "41bJFweA1m3Mp9UOTXMr82kQeFCSGu2AtYweii1Rn9CacNTeHor3tPzZfOa1Ty7q"
@@ -18,11 +22,11 @@ SYMBOLS = ["AAVEUSDT","LTCUSDT","INJUSDT","XRPUSDT","ADAUSDT","HBARUSDT"]
 ENTRY_INTERVAL = Client.KLINE_INTERVAL_5MINUTE
 TREND_INTERVAL = Client.KLINE_INTERVAL_15MINUTE
 LEVERAGE = 20
-RISK_PER_TRADE = 10
-SL_ATR_MULT = 1.2
-BE_ATR_MULT = 1.0
-BE_OFFSET = 0.1
-TRAIL_ATR_MULT = 1.0
+RISK_PER_TRADE = 10  # USDT риска на сделку (без учёта плеча)
+SL_ATR_MULT = 2.5
+BE_ATR_MULT = 3.0
+BE_OFFSET = 0.3  # небольшое смещение для BE (в цене, не в %)
+TRAIL_ATR_MULT = 3.3
 BOT_ON = True
 
 STATS_FILE = "stats.json"
@@ -30,7 +34,7 @@ STATS_INTERVAL = 1800  # секунд (30 минут)
 
 # ================== BINANCE ==================
 client = Client(API_KEY, API_SECRET, requests_params={"timeout": 30})
-client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"  # Тестнет
 client.timestamp_offset = client.get_server_time()["serverTime"] - int(time.time() * 1000)
 exchange_info = client.futures_exchange_info()
 
@@ -46,16 +50,26 @@ class Stats:
                 with open(STATS_FILE, 'r') as f:
                     data = json.load(f)
                     self.trades = data.get("trades", [])
-            except:
+            except Exception as e:
+                logging.error(f"Ошибка загрузки stats: {e}")
                 self.trades = []
 
     def save(self):
-        with open(STATS_FILE, 'w') as f:
-            json.dump({"trades": self.trades}, f)
+        try:
+            with open(STATS_FILE, 'w') as f:
+                json.dump({"trades": self.trades}, f)
+        except Exception as e:
+            logging.error(f"Ошибка сохранения stats: {e}")
 
     def add_trade(self, symbol, side, entry, exit_price, qty):
-        pnl = (exit_price - entry) * qty if side == "BUY" else (entry - exit_price) * qty
-        pnl *= LEVERAGE  # учитываем плечо
+        # Правильный расчёт PnL для USDT-M perpetual futures
+        # PnL = qty * (exit - entry) для LONG, qty * (entry - exit) для SHORT
+        # Уже умножено на плечо благодаря размеру позиции (notional * leverage)
+        if side == "BUY":
+            pnl = qty * (exit_price - entry)
+        else:
+            pnl = qty * (entry - exit_price)
+        pnl = round(pnl, 2)
         win = pnl > 0
         self.trades.append({
             "symbol": symbol,
@@ -63,7 +77,7 @@ class Stats:
             "entry": entry,
             "exit": exit_price,
             "qty": qty,
-            "pnl": round(pnl, 2),
+            "pnl": pnl,
             "win": win,
             "timestamp": int(time.time())
         })
@@ -80,26 +94,27 @@ class Stats:
         winrate = round(wins / total * 100, 2) if total > 0 else 0
         total_pnl = round(sum(t["pnl"] for t in self.trades), 2)
         
-        return f"""📊 Статистика бота
-Всего сделок: {total}
-Побед: {wins} | Поражений: {losses}
-Винрейт: {winrate}%
-Общий PnL: {total_pnl:+.2f} USDT
-Активных позиций: {len(positions)}"""
+        return (f"📊 Статистика бота\n"
+                f"Всего сделок: {total}\n"
+                f"Побед: {wins} | Поражений: {losses}\n"
+                f"Винрейт: {winrate}%\n"
+                f"Общий PnL: <b>{total_pnl:+.2f}</b> USDT\n"
+                f"Активных позиций: {len(positions)}")
 
 stats = Stats()
 
 # ================== SAFE API ==================
-def safe_api(retries=3, delay=1):
+def safe_api(retries=3, delay=2):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            for _ in range(retries):
+            for attempt in range(retries):
                 try:
                     return func(*args, **kwargs)
                 except Exception as e:
-                    print("API error:", e)
+                    logging.warning(f"API error в {func.__name__}: {e} (попытка {attempt+1}/{retries})")
                     time.sleep(delay)
+            logging.error(f"Не удалось выполнить {func.__name__} после {retries} попыток")
             return None
         return wrapper
     return decorator
@@ -110,21 +125,30 @@ def get_filters(symbol):
         if s["symbol"] == symbol:
             lot = next(f for f in s["filters"] if f["filterType"] == "LOT_SIZE")
             price = next(f for f in s["filters"] if f["filterType"] == "PRICE_FILTER")
-            return float(lot["stepSize"]), float(lot["minQty"]), float(price["tickSize"])
-    return 0.001, 0.001, 0.01
+            min_notional = next((f for f in s["filters"] if f["filterType"] == "MIN_NOTIONAL"), {"notional": "5"})
+            return (float(lot["stepSize"]), float(lot["minQty"]), float(price["tickSize"]),
+                    float(min_notional.get("notional", 5)))
+    return 0.001, 0.001, 0.01, 5.0
 
 def precision(step):
     return max(0, len(str(step).split('.')[-1].rstrip('0')))
 
 def fmt_qty(symbol, qty):
-    step, min_qty, _ = get_filters(symbol)
+    step, min_qty, _, min_notional = get_filters(symbol)
     qty = floor(qty / step) * step
-    return round(qty, precision(step)) if qty >= min_qty else 0
+    qty = round(qty, precision(step))
+    return qty if qty >= min_qty and qty * current_price(symbol) >= min_notional else 0
 
 def fmt_price(symbol, price):
-    _, _, tick = get_filters(symbol)
+    _, _, tick, _ = get_filters(symbol)
     price = floor(price / tick) * tick
     return round(price, precision(tick))
+
+def current_price(symbol):
+    try:
+        return float(client.futures_symbol_ticker(symbol=symbol)["price"])
+    except:
+        return 0.0
 
 # ================== MARKET DATA ==================
 @safe_api()
@@ -146,7 +170,7 @@ def indicators(df):
     loss = -delta.clip(upper=0).rolling(14).mean()
     df["rsi"] = 100 - (100 / (1 + gain / loss))
     df["vol_ma"] = df["v"].rolling(20).mean()
-    df["atr"] = (df["h"] - df["l"]).rolling(14).mean()
+    df["atr"] = (df["h"] - df["l"]).rolling(14).mean()  # True Range упрощённо как H-L
     return df
 
 # ================== ENTRY LOGIC ==================
@@ -160,11 +184,13 @@ def pullback(r):
 
 def improved_entry(df):
     r = df.iloc[-1]
-    if r.atr < r.c * 0.0012:
+    if r.atr < r.c * 0.0012:  # фильтр низкой волатильности
         return None
-    if r.ema9 > r.ema21 and pullback(r) and impulse(r) and 52 <= r.rsi <= 65 and r.v > r.vol_ma * 1.2:
+    if (r.ema9 > r.ema21 and pullback(r) and impulse(r) and
+        52 <= r.rsi <= 65 and r.v > r.vol_ma * 1.2):
         return "BUY"
-    if r.ema9 < r.ema21 and pullback(r) and impulse(r) and 35 <= r.rsi <= 48 and r.v > r.vol_ma * 1.2:
+    if (r.ema9 < r.ema21 and pullback(r) and impulse(r) and
+        35 <= r.rsi <= 48 and r.v > r.vol_ma * 1.2):
         return "SELL"
     return None
 
@@ -186,10 +212,10 @@ def tg(msg):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": msg, "parse_mode":"HTML"}
+            json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}
         )
-    except:
-        pass
+    except Exception as e:
+        logging.error(f"Ошибка отправки в TG: {e}")
 
 # ================== TRADE ==================
 @safe_api()
@@ -201,17 +227,30 @@ def trade(symbol):
         return
     df = indicators(get_klines(symbol, ENTRY_INTERVAL))
     side = improved_entry(df)
-    if side != trend:
+    if not side or side != trend:
         return
-    price = fmt_price(symbol, float(client.futures_symbol_ticker(symbol=symbol)["price"]))
+
+    price = fmt_price(symbol, current_price(symbol))
+    if price == 0:
+        return
+
     qty = fmt_qty(symbol, (RISK_PER_TRADE * LEVERAGE) / price)
     if qty == 0:
         return
+
     atr = df.iloc[-1].atr
-    client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
-    client.futures_create_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
+
+    try:
+        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+        client.futures_create_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
+    except Exception as e:
+        logging.error(f"Ошибка открытия позиции {symbol}: {e}")
+        tg(f"❌ Ошибка открытия {symbol}: {str(e)}")
+        return
+
     sl = price - atr * SL_ATR_MULT if side == "BUY" else price + atr * SL_ATR_MULT
     sl = fmt_price(symbol, sl)
+
     positions[symbol] = {
         "side": side,
         "qty": qty,
@@ -220,7 +259,14 @@ def trade(symbol):
         "sl": sl,
         "be": False
     }
-    tg(f"🚀 <b>{symbol}</b>\n{side} | Левередж x{LEVERAGE}\nEntry: {price}\nSL: {sl}\nРазмер: {qty}")
+
+    tg(f"🚀 <b>{symbol}</b>\n"
+       f"{side} | x{LEVERAGE}\n"
+       f"Entry: <b>{price}</b>\n"
+       f"SL: <b>{sl}</b>\n"
+       f"Qty: {qty}")
+
+    logging.info(f"Открыта позиция {symbol} {side} по {price}, qty={qty}")
 
 # ================== MANAGER ==================
 def manager():
@@ -228,47 +274,61 @@ def manager():
     while True:
         current_time = time.time()
         
-        # Периодический вывод статистики
+        # Периодическая статистика
         if current_time - last_stats_time >= STATS_INTERVAL:
             tg(stats.get_summary())
             last_stats_time = current_time
 
-        for s in list(positions):
+        for s in list(positions.keys()):
+            if s not in positions:
+                continue
             p = positions[s]
-            price = fmt_price(s, float(client.futures_symbol_ticker(symbol=s)["price"]))
-            
-            # BE
+            try:
+                price = fmt_price(s, current_price(s))
+            except:
+                continue
+
+            # Break Even
             if not p["be"]:
                 move = abs(price - p["entry"])
                 if move >= p["atr"] * BE_ATR_MULT:
-                    p["sl"] = p["entry"] + BE_OFFSET if p["side"] == "BUY" else p["entry"] - BE_OFFSET
+                    new_sl = p["entry"] + BE_OFFSET if p["side"] == "BUY" else p["entry"] - BE_OFFSET
+                    new_sl = fmt_price(s, new_sl)
+                    p["sl"] = new_sl
                     p["be"] = True
-                    tg(f"🟡 <b>BE активирован</b> {s}\nSL перемещён в безубыток")
+                    tg(f"🟡 <b>BE активирован</b> {s}\nSL → <b>{new_sl}</b>")
 
-            # Trailing
+            # Trailing Stop после BE
             if p["be"]:
                 new_sl = price - p["atr"] * TRAIL_ATR_MULT if p["side"] == "BUY" else price + p["atr"] * TRAIL_ATR_MULT
+                new_sl = fmt_price(s, new_sl)
                 if (p["side"] == "BUY" and new_sl > p["sl"]) or (p["side"] == "SELL" and new_sl < p["sl"]):
                     old_sl = p["sl"]
-                    p["sl"] = fmt_price(s, new_sl)
-                    tg(f"🔄 <b>Trailing SL</b> {s}\n{old_sl} → {p['sl']}")
+                    p["sl"] = new_sl
+                    tg(f"🔄 <b>Trailing SL</b> {s}\n{old_sl} → <b>{p['sl']}</b>")
 
-            # Stop / Exit
-            exit_triggered = (p["side"] == "BUY" and price <= p["sl"]) or (p["side"] == "SELL" and price >= p["sl"])
+            # Выход по SL
+            exit_triggered = ((p["side"] == "BUY" and price <= p["sl"]) or
+                              (p["side"] == "SELL" and price >= p["sl"]))
             if exit_triggered:
                 close_side = "SELL" if p["side"] == "BUY" else "BUY"
-                client.futures_create_order(
-                    symbol=s, side=close_side, type="MARKET",
-                    quantity=p["qty"], reduceOnly=True
-                )
+                try:
+                    client.futures_create_order(
+                        symbol=s, side=close_side, type="MARKET",
+                        quantity=p["qty"], reduceOnly=True
+                    )
+                except Exception as e:
+                    logging.error(f"Ошибка закрытия {s}: {e}")
+                    tg(f"❌ Ошибка закрытия {s}: {str(e)}")
+                    continue
+
                 pnl = stats.add_trade(s, p["side"], p["entry"], price, p["qty"])
                 result_emoji = "🟢" if pnl > 0 else "🔴"
-                positions.pop(s)
+                positions.pop(s, None)
                 tg(f"{result_emoji} <b>ВЫХОД {s}</b>\n"
-                   f"Сделка: {p['side']}\n"
-                   f"Entry: {p['entry']} → Exit: {price}\n"
-                   f"PnL: {pnl:+.2f} USDT")
-        
+                   f"{p['side']} | Entry: {p['entry']} → Exit: {price}\n"
+                   f"PnL: <b>{pnl:+.2f}</b> USDT")
+
         time.sleep(1)
 
 # ================== MAIN ==================
