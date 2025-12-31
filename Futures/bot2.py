@@ -18,18 +18,18 @@ API_KEY = "41bJFweA1m3Mp9UOTXMr82kQeFCSGu2AtYweii1Rn9CacNTeHor3tPzZfOa1Ty7q"
 API_SECRET = "JTNiSXaKeBvcl3oFDN8GgP6rR2KgCfIhW8f1ByEAU4EsD2Ijid1dAn8b9wBotHS6"
 TG_TOKEN = "8554034676:AAEIEPOwkWYFz9_dpDla2jfu-t5EDRpSygE"
 CHAT_ID = "5540625088"
-SYMBOLS = ["BCHUSDT","SOLUSDT","FILUSDT","AVAXUSDT","TRXUSDT","OPUSDT"]
+SYMBOLS = ["AAVEUSDT","LTCUSDT","INJUSDT","XRPUSDT","ADAUSDT","HBARUSDT"]
 ENTRY_INTERVAL = Client.KLINE_INTERVAL_5MINUTE
-TREND_INTERVAL = Client.KLINE_INTERVAL_15MINUTE
+TREND_INTERVAL = Client.KLINE_INTERVAL_30MINUTE
 LEVERAGE = 20
 RISK_PER_TRADE = 10  # USDT риска на сделку (без учёта плеча)
-SL_ATR_MULT = 3.5
+SL_ATR_MULT = 1.5
 BE_ATR_MULT = 2.5
-BE_OFFSET = 0.1  # небольшое смещение для BE (в цене, не в %)
-TRAIL_ATR_MULT = 1.0
+BE_OFFSET = 0.5  # небольшое смещение для BE (в цене, не в %)
+TRAIL_ATR_MULT = 0.5
 BOT_ON = True
 
-STATS_FILE = "statskalper.json"
+STATS_FILE = "stats.json"
 STATS_INTERVAL = 1800  # секунд (30 минут)
 
 # ================== BINANCE ==================
@@ -86,7 +86,7 @@ class Stats:
 
     def get_summary(self):
         if not self.trades:
-            return "📊 Skalper Статистика пуста\nНет завершённых сделок"
+            return "📊 Статистика пуста\nНет завершённых сделок"
         
         total = len(self.trades)
         wins = sum(1 for t in self.trades if t["win"])
@@ -94,7 +94,7 @@ class Stats:
         winrate = round(wins / total * 100, 2) if total > 0 else 0
         total_pnl = round(sum(t["pnl"] for t in self.trades), 2)
         
-        return (f"📊<b>Skalper</b> Статистика бота\n"
+        return (f"📊 Статистика бота\n"
                 f"Всего сделок: {total}\n"
                 f"Побед: {wins} | Поражений: {losses}\n"
                 f"Винрейт: {winrate}%\n"
@@ -260,7 +260,7 @@ def trade(symbol):
         "be": False
     }
 
-    tg(f"<b>Skalper</b> 🚀 <b>{symbol}</b>\n"
+    tg(f"🚀 <b>{symbol}</b>\n"
        f"{side} | x{LEVERAGE}\n"
        f"Entry: <b>{price}</b>\n"
        f"SL: <b>{sl}</b>\n"
@@ -296,7 +296,7 @@ def manager():
                     new_sl = fmt_price(s, new_sl)
                     p["sl"] = new_sl
                     p["be"] = True
-                    tg(f"🟡 <b>Skalper</b><b>BE активирован</b> {s}\nSL → <b>{new_sl}</b>")
+                    tg(f"🟡 <b>BE активирован</b> {s}\nSL → <b>{new_sl}</b>")
 
             # Trailing Stop после BE
             if p["be"]:
@@ -305,7 +305,7 @@ def manager():
                 if (p["side"] == "BUY" and new_sl > p["sl"]) or (p["side"] == "SELL" and new_sl < p["sl"]):
                     old_sl = p["sl"]
                     p["sl"] = new_sl
-                    tg(f"🔄 <b>Skalper</b><b>Trailing SL</b> {s}\n{old_sl} → <b>{p['sl']}</b>")
+                    tg(f"🔄 <b>Trailing SL</b> {s}\n{old_sl} → <b>{p['sl']}</b>")
 
             # Выход по SL
             exit_triggered = ((p["side"] == "BUY" and price <= p["sl"]) or
@@ -325,7 +325,7 @@ def manager():
                 pnl = stats.add_trade(s, p["side"], p["entry"], price, p["qty"])
                 result_emoji = "🟢" if pnl > 0 else "🔴"
                 positions.pop(s, None)
-                tg(f"{result_emoji} <b>Skalper</b> <b>ВЫХОД {s}</b>\n"
+                tg(f"{result_emoji} <b>ВЫХОД {s}</b>\n"
                    f"{p['side']} | Entry: {p['entry']} → Exit: {price}\n"
                    f"PnL: <b>{pnl:+.2f}</b> USDT")
 
@@ -333,7 +333,7 @@ def manager():
 
 # ================== MAIN ==================
 threading.Thread(target=manager, daemon=True).start()
-tg("🤖 <b>Працівник <b>Skalper</b> працює</b>\nMTF + ATR Management + Статистика\n" + stats.get_summary())
+tg("🤖 <b>Працівник працює</b>\nMTF + ATR Management + Статистика\n" + stats.get_summary())
 
 while True:
     if BOT_ON:
